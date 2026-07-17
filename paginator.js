@@ -807,7 +807,24 @@ export class Paginator extends HTMLElement {
         const { start, end, pages, size } = this
         const min = Math.abs(offset) - a
         const max = Math.abs(offset) + b
-        const d = velocity * (this.#rtl ? -size : size)
+        // Emend patch: upstream committed a page only when (drag + last-frame
+        // velocity) crossed half a page — but fingers decelerate before lift-off
+        // so the instantaneous velocity reads ~0 and light flicks bounce back.
+        // Blend in the whole-gesture average velocity, amplify (K), and add a
+        // direction bias so ~25% drag or a modest flick commits the turn.
+        const state = this.#touchState ?? {}
+        const total = this.#vertical
+            ? (state.sy ?? 0) - (state.y ?? 0)
+            : (state.sx ?? 0) - (state.x ?? 0)
+        const dur = (state.t ?? 0) - (state.st ?? 0)
+        const avg = dur > 0 ? total / dur : 0
+        const vEff = Math.sign(velocity || avg) === Math.sign(avg)
+            ? (Math.abs(avg) > Math.abs(velocity || 0) ? avg : velocity)
+            : velocity
+        const K = 1.5, BIAS = 0.25
+        const dirSize = this.#rtl ? -size : size
+        const d = (isNaN(vEff) ? 0 : vEff) * dirSize * K
+            + Math.sign(total || 0) * dirSize * BIAS
         const page = Math.floor(
             Math.max(min, Math.min(max, (start + end) / 2
                 + (isNaN(d) ? 0 : d))) / size)
@@ -822,10 +839,13 @@ export class Paginator extends HTMLElement {
     }
     #onTouchStart(e) {
         const touch = e.changedTouches[0]
+        // Emend patch: track gesture origin (sx/sy/st) for axis lock, tap
+        // detection and whole-gesture average velocity; fix upstream `xy` typo
         this.#touchState = {
+            sx: touch?.screenX, sy: touch?.screenY, st: e.timeStamp,
             x: touch?.screenX, y: touch?.screenY,
             t: e.timeStamp,
-            vx: 0, xy: 0,
+            vx: 0, vy: 0, axis: null,
         }
     }
     #onTouchMove(e) {
@@ -837,9 +857,22 @@ export class Paginator extends HTMLElement {
             if (this.#touchScrolled) e.preventDefault()
             return
         }
-        e.preventDefault()
+        // Emend patch: don't fight an active text selection (selecting words
+        // must not drag the page around)
+        const sel = this.#view?.document?.getSelection?.()
+        if (sel && !sel.isCollapsed) return
         const touch = e.changedTouches[0]
         const x = touch.screenX, y = touch.screenY
+        // Emend patch: axis lock — decide the dominant axis once from the
+        // accumulated displacement; gestures on the non-paging axis are
+        // ignored instead of dragging the page diagonally
+        if (!state.axis) {
+            const adx = Math.abs(x - state.sx), ady = Math.abs(y - state.sy)
+            if (Math.max(adx, ady) > 8) state.axis = adx >= ady ? 'x' : 'y'
+        }
+        const pageAxis = this.#vertical ? 'y' : 'x'
+        if (state.axis && state.axis !== pageAxis) return
+        e.preventDefault()
         const dx = state.x - x, dy = state.y - y
         const dt = e.timeStamp - state.t
         state.x = x
@@ -853,6 +886,13 @@ export class Paginator extends HTMLElement {
     #onTouchEnd() {
         this.#touchScrolled = false
         if (this.scrolled) return
+
+        // Emend patch: a plain tap (no real drag) must not snap — the deferred
+        // snap races the click-to-turn animation and yanks it back to the
+        // current page ("tap turns then bounces back" bug)
+        const s = this.#touchState
+        const moved = Math.hypot((s?.x ?? 0) - (s?.sx ?? 0), (s?.y ?? 0) - (s?.sy ?? 0))
+        if (!(moved > 12)) return
 
         // XXX: Firefox seems to report scale as 1... sometimes...?
         // at this point I'm basically throwing `requestAnimationFrame` at
@@ -898,18 +938,53 @@ export class Paginator extends HTMLElement {
         }
         // FIXME: vertical-rl only, not -lr
         if (this.scrolled && this.#vertical) offset = -offset
-        if ((reason === 'snap' || smooth) && this.hasAttribute('animated')) return animate(
-            element[scrollProp], offset, 300, easeOutQuad,
-            x => element[scrollProp] = x,
-        ).then(() => {
-            this.#scrollBounds = [offset, this.atStart ? 0 : size, this.atEnd ? 0 : size]
-            this.#afterScroll(reason)
-        })
+        // Emend patch: compositor-driven page-turn animation. Upstream animated
+        // scrollLeft frame-by-frame on the main thread, forcing Android WebView
+        // to re-rasterize the multicolumn content every frame (stale tiles
+        // during the animation, visible reflow jump at the end). Transforming
+        // the content layer runs on the compositor thread instead; the real
+        // scroll offset is written once when the transition settles.
+        if ((reason === 'snap' || smooth) && this.hasAttribute('animated'))
+            return this.#animateScrollTo(offset, reason)
         else {
             element[scrollProp] = offset
             this.#scrollBounds = [offset, this.atStart ? 0 : size, this.atEnd ? 0 : size]
             this.#afterScroll(reason)
         }
+    }
+    // Emend patch: see #scrollTo — translate the content layer with a CSS
+    // transition, then settle the real scroll position in one write
+    #animateScrollTo(offset, reason) {
+        const element = this.#container
+        const child = this.#view?.element
+        const { scrollProp, size } = this
+        const from = element[scrollProp]
+        const delta = offset - from
+        const settle = () => {
+            element[scrollProp] = offset
+            this.#scrollBounds = [offset, this.atStart ? 0 : size, this.atEnd ? 0 : size]
+            this.#afterScroll(reason)
+        }
+        if (!child || !delta) return Promise.resolve().then(settle)
+        return new Promise(resolve => {
+            let settled = false
+            const done = () => {
+                if (settled) return
+                settled = true
+                child.style.transition = ''
+                child.style.transform = ''
+                child.style.willChange = ''
+                resolve()
+            }
+            child.style.willChange = 'transform'
+            void child.getBoundingClientRect() // force style flush so the transition takes
+            child.style.transition = 'transform 260ms cubic-bezier(.22, .61, .36, 1)'
+            child.style.transform = this.#vertical
+                ? `translateY(${-delta}px)` : `translateX(${-delta}px)`
+            child.addEventListener('transitionend', done, { once: true })
+            // transitionend can be swallowed (hidden tab, interrupted layout)
+            setTimeout(done, 320)
+        }).then(settle)
     }
     async #scrollToPage(page, reason, smooth) {
         const offset = this.size * (this.#rtl ? -page : page)

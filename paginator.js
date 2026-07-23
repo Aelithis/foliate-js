@@ -621,6 +621,8 @@ export class Paginator extends HTMLElement {
 
         this.#mediaQueryListener = () => {
             if (!this.#view) return
+            // Emend patch: respect `no-background` (see #beforeRender)
+            if (this.hasAttribute('no-background')) return
             this.#background.style.background = getBackground(this.#view.document)
         }
         this.#mediaQuery.addEventListener('change', this.#mediaQueryListener)
@@ -682,7 +684,10 @@ export class Paginator extends HTMLElement {
 
         // set background to `doc` background
         // this is needed because the iframe does not fill the whole element
-        this.#background.style.background = background
+        // Emend patch: `no-background` opts out — footnote popup views sit on the
+        // host card surface; painting the doc background here shows as a darker block
+        if (!this.hasAttribute('no-background'))
+            this.#background.style.background = background
 
         const { width, height } = this.#container.getBoundingClientRect()
         const size = vertical ? height : width
@@ -1184,8 +1189,10 @@ export class Paginator extends HTMLElement {
         } else $style.textContent = styles
 
         // NOTE: needs `requestAnimationFrame` in Chromium
-        requestAnimationFrame(() =>
-            this.#background.style.background = getBackground(this.#view.document))
+        // Emend patch: respect `no-background` (see #beforeRender)
+        if (!this.hasAttribute('no-background'))
+            requestAnimationFrame(() =>
+                this.#background.style.background = getBackground(this.#view.document))
 
         // needed because the resize observer doesn't work in Firefox
         this.#view?.document?.fonts?.ready?.then(() => this.#view.expand())
